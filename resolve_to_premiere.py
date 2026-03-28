@@ -48,6 +48,7 @@ from timeline_extractor import TimelineExtractor
 from lut_exporter import LUTExporter
 from premiere_xml_builder import PremiereXMLBuilder
 from effects_mapper import EffectsMapper
+from xml_patcher import XMLPatcher
 
 
 def get_resolve():
@@ -280,26 +281,55 @@ class ConverterApp:
             timeline_data = extractor.extract(options)
             self._update_progress(25, f"Extracted {timeline_data['clip_count']} clips")
 
-            # Step 2: Export LUTs
+            # Step 2: Export LUTs for all clips
+            lut_map = {}
             if options["export_luts"]:
                 self._update_progress(30, "Exporting color grades as LUTs...")
-                lut_exporter = LUTExporter(self.resolve, self.project, timeline)
-                lut_map = lut_exporter.export_all(lut_dir, timeline_data, options)
-                timeline_data["lut_map"] = lut_map
-                self._update_progress(55, f"Exported {len(lut_map)} LUTs")
+                try:
+                    lut_exporter = LUTExporter(self.resolve, self.project, timeline)
+                    lut_map = lut_exporter.export_all(lut_dir, timeline_data, options)
+                    timeline_data["lut_map"] = lut_map
+                    self._update_progress(55, f"Exported {len(lut_map)} LUTs")
+                except Exception as e:
+                    timeline_data["lut_map"] = {}
+                    timeline_data.setdefault("warnings", []).append(f"LUT export skipped: {str(e)}")
+                    self._update_progress(55, "LUT export skipped (no grades or unsupported)")
 
-            # Step 3: Map effects
-            self._update_progress(60, "Mapping effects and transforms...")
-            effects_mapper = EffectsMapper()
-            timeline_data = effects_mapper.map_all(timeline_data, options)
-            self._update_progress(70, "Effects mapped")
-
-            # Step 4: Build Premiere XML
-            self._update_progress(75, "Generating Premiere Pro XML...")
-            xml_builder = PremiereXMLBuilder()
+            # Step 3: Export via Resolve's built-in FCP 7 XML exporter
+            self._update_progress(65, "Exporting FCP 7 XML via Resolve native exporter...")
             xml_path = os.path.join(output_base, f"{tl_name}.xml")
-            xml_builder.build(timeline_data, xml_path, lut_dir, options)
-            self._update_progress(90, "XML generated")
+            export_success = False
+            try:
+                export_success = timeline.Export(xml_path, self.resolve.EXPORT_FCP_7_XML, self.resolve.EXPORT_NONE)
+            except Exception:
+                pass
+
+            if not export_success:
+                self._update_progress(70, "Generating Premiere Pro XML (fallback)...")
+                xml_builder = PremiereXMLBuilder()
+                xml_builder.build(timeline_data, xml_path, lut_dir, options)
+
+            # Step 4: Patch XML to embed LUT references for Premiere auto-apply
+            if lut_map and os.path.exists(xml_path):
+                self._update_progress(80, "Embedding LUT references into XML...")
+                try:
+                    patcher = XMLPatcher()
+                    lut_map_by_name = {}
+                    for clip_id, lut_path in lut_map.items():
+                        stem = os.path.splitext(os.path.basename(lut_path))[0]
+                        lut_map_by_name[stem] = lut_path
+                    # Also map by clip name from timeline_data
+                    for track in timeline_data.get("video_tracks", []):
+                        for clip in track.get("clips", []):
+                            if clip["id"] in lut_map:
+                                clip_stem = os.path.splitext(clip["name"])[0]
+                                lut_map_by_name[clip_stem] = lut_map[clip["id"]]
+                    patcher.patch(xml_path, lut_map_by_name, lut_dir)
+                    self._update_progress(88, "LUT references embedded — Premiere will auto-apply colors")
+                except Exception as e:
+                    timeline_data.setdefault("warnings", []).append(f"XML patch warning: {str(e)}")
+
+            self._update_progress(90, "XML ready")
 
             # Step 5: Write mapping report
             self._update_progress(92, "Writing conversion report...")
